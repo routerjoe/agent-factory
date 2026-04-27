@@ -12,3 +12,7 @@ venv/
 
 # spike artifacts (raw event captures may include resource ids)
 spike_events.jsonl
+spike1b_events.jsonl
+spike1b_results.json
+spike1b_t240_pending.json
+spike1b_t240_poller.log
