@@ -1,65 +1,139 @@
 # SPIKE_RESULTS — agent-creates-agent
 
-**Status: NOT YET RUN.** spike.py is written but not executed (per user instruction). Fill in the "Run results" section after running it.
+## Verdict: **PASS**
 
----
+Agent A (a Managed Agent in this account) drove creation of a second Managed Agent (`spike-child`) end-to-end. `spike-child` was found in `client.beta.agents.list()` under the same `agent_id` returned by the host's `agents.create()` call. End-to-end latency was 11.5 s, first try.
 
-## Question
+## Recommendation: **agent-creates-agent IS viable**, with one architectural constraint.
 
-Can a Claude Managed Agent call the Anthropic Managed Agents API as a tool to create another Managed Agent?
+**You cannot give an agent its own bash + the SDK + a key and let it self-manage.** Per `managed-agents-client-patterns.md`: *"secrets currently hold MCP credentials only — they are not exposed to the container's shell."* Vaults can't inject `ANTHROPIC_API_KEY` into the sandbox. Every "agent creates agent" interaction has to go through either:
 
-## Approach (chosen)
+- **(a) A long-running host that intercepts custom-tool events** — the pattern this spike proves. Build a control plane that holds the master key and handles `agent.custom_tool_use` events out-of-band. This is what Foundry should do. Note the implication: "fire-and-forget" sessions that need to spawn agents won't work without that host running.
+- **(b) An MCP server you operate** that wraps `agents.create` and lives at a URL the sandbox can reach.
 
-**Host-mediated custom tool.** Agent A is configured with one custom tool, `create_managed_agent`. When the agent invokes it, the session emits `agent.custom_tool_use` and idles; spike.py (the host) intercepts that event, calls `client.beta.agents.create()` itself, and posts the result back as `user.custom_tool_result`. The master `ANTHROPIC_API_KEY` never enters the sandbox.
+If your project plan assumed (a), proceed. If it assumed agents would self-bootstrap inside their own sandbox, redesign.
 
-This is a strict reading of the spec — "the agent can drive creation of another agent" — and matches what a production system would actually do. It does NOT prove that an agent's *own bash tool* can call the API; that path is blocked anyway (see "Quirks" below).
+## What worked
 
-## Pre-run findings (from docs)
+- Beta header `managed-agents-2026-04-01` is auto-applied by `anthropic` 0.97.0 on `client.beta.*` — no manual header needed.
+- `client.beta.environments.create(name=..., config={"type":"cloud","networking":{"type":"unrestricted"}})` returned `env_*` immediately.
+- `client.beta.agents.create(name=..., model="claude-opus-4-7", system=..., tools=[<one custom tool>])` returned `agent_*` immediately. `claude-opus-4-7` is in the SDK's accepted `Model` literal.
+- Custom-tool config is `{type: "custom", name, description, input_schema}` — works as expected.
+- `client.beta.sessions.create(agent=agent_id, environment_id=env_id, title=...)` accepts a bare string for `agent` (not just an object form) and returns `sesn_*`.
+- `client.beta.sessions.events.send(session_id, events=[{"type":"user.message", "content":[{"type":"text","text":"..."}]}])` worked with the keyword shape Python convention dictates. (TS docs show positional+body-dict; Python is positional `session_id` + `events=` kwarg.)
+- `client.beta.sessions.events.list(session_id, order="asc")` is a `SyncPageCursor` that auto-paginates when iterated. Polling loop dedupes by `ev.id`.
+- Event flow ran exactly as the SDK Pydantic types predicted.
 
-- Beta header `managed-agents-2026-04-01` is auto-applied by the SDK on `client.beta.{agents,environments,sessions,vaults}.*`.
-- Pricing: **$0.08/session-hour** + normal token costs. The spike caps session time at 5 minutes, so the session-hour charge should be ≤ ~$0.007.
-- `agent_toolset_20260401` includes `bash`, `read`, `write`, `edit`, `glob`, `grep`, `web_fetch`, `web_search`. **No built-in `anthropic_api` tool.**
-- Per `managed-agents-client-patterns.md`: *"secrets currently hold MCP credentials only — they are not exposed to the container's shell."* So vaults cannot inject `ANTHROPIC_API_KEY` as an env var into bash. This rules out the naive "agent installs the SDK and calls the API itself" path unless you embed the key in the prompt, which the docs explicitly warn against.
-- Networking: `unrestricted` ("full egress except legal blocklist") vs. `package_managers_and_custom` (with `allowed_hosts`). Spike uses `unrestricted` for simplicity, although it isn't strictly needed for the chosen approach.
-- Agents have **no DELETE** — only `archive`. Environments and sessions support `delete`.
-- Session lifecycle signal: `session.status_idle` event indicates the agent has finished its turn (or is awaiting a custom tool result).
+### Observed event sequence (from `spike_events.jsonl`)
 
-## Run results
+```
+1.  user.message                                                  (host -> session)
+2.  session.status_running
+3.  span.model_request_start
+4.  agent.custom_tool_use      name=create_managed_agent          <-- the meta-call
+5.  span.model_request_end
+6.  session.status_idle        stop_reason.type=requires_action
+                               stop_reason.event_ids=[<id of #4>]
+7.  user.custom_tool_result    custom_tool_use_id=<id of #4>      (host -> session)
+8.  session.status_running
+9.  span.model_request_start
+10. agent.message              content=[TextBlock("agent_011...")]
+11. span.model_request_end
+12. session.status_idle        stop_reason.type=end_turn          <-- DONE
+```
 
-**Fill in after running `python3 spike.py`.**
+### Confirmed event shapes (from live run, not docs)
 
-- Verdict: PASS / FAIL / PARTIAL
-- Total elapsed:
-- agent_a_id:
-- child_agent_id (returned by spike.py):
-- child_agent_id (found in `agents.list()`):
-- Final assistant text from Agent A:
+```jsonc
+// agent.custom_tool_use — FLAT, not nested under "tool_use"
+{
+  "id": "sevt_012KSsjuMqrJ9iCADnutedQv",
+  "type": "agent.custom_tool_use",
+  "name": "create_managed_agent",
+  "input": { "name": "spike-child", "system_prompt": "..." },
+  "processed_at": "2026-04-27T00:37:55.868000Z"
+}
 
-### What worked
+// session.status_idle — discriminator on stop_reason.type
+{
+  "id": "sevt_01FTT6E84EWkYTCqEyfjrwyS",
+  "type": "session.status_idle",
+  "stop_reason": {
+    "type": "requires_action",
+    "event_ids": ["sevt_012KSsjuMqrJ9iCADnutedQv"]
+  }
+}
+{ "stop_reason": { "type": "end_turn" } }   // simpler shape
 
--
+// agent.message — content is a flat List[TextBlock] on the event itself
+{
+  "id": "sevt_01HHegXKikkP3z29jAL3r36z",
+  "type": "agent.message",
+  "content": [{ "type": "text", "text": "agent_011CaT..." }]
+}
+```
 
-### What didn't (paste API errors verbatim)
+The `id` of an `agent.custom_tool_use` event **is** the value the API expects as `custom_tool_use_id` in the reply. (No separate tool_use_id.) This wasn't quoted in any docs page I could find — confirmed only by reading the SDK Pydantic types and then by the live run.
 
--
+## What didn't (verbatim)
 
-### Iteration notes
+One real bug, found by `cleanup.py`:
 
-The most likely places spike.py will need a small fix on first run:
+```
+list sessions failed: Error code: 400 - {'type': 'error', 'error':
+{'type': 'invalid_request_error',
+ 'message': 'limit: value must be greater than or equal to 1 and less than or equal to 100'},
+ 'request_id': 'req_011CaTLoU3K1MF1VadszzC7g'}
+```
 
-1. **Exact shape of the `agent.custom_tool_use` event.** The events doc lists the type but not the JSON payload. spike.py probes both `ev.tool_use.{id,name,input}` and the flattened `ev.{tool_use_id,name,input}` shape via the `_g` helper — if both miss, you'll see `! unexpected tool: None` in the log and need to print the raw event.
-2. **Field name when posting the tool result.** spike.py uses `custom_tool_use_id` (per `managed-agents-api-reference.md`); if the actual field is `tool_use_id`, the API will return a 422 and the agent will never see the result.
-3. **`events.send` signature.** TypeScript example is `send(sessionId, {events})`. Python convention is `send(session_id=..., events=[...])`, which spike.py uses; if the SDK actually uses positional + body dict, swap accordingly.
-4. **`events.list` pagination.** spike.py reads everything in one call (`limit=1000`). For long-running sessions you'd want a cursor; not needed for this spike.
+The events doc says `events.list` accepts `limit default 1000`. For `agents.list` and `sessions.list` the cap is **100**. Fix in cleanup.py: use `limit=100` (or omit and let it default). Re-run succeeded:
 
-## Recommendation
+```
+[sessions]
+  delete session sesn_011CaTLmqnTHGErsgYAouzSu title='spike-session'
+[agents]
+  archive agent agent_011CaTLnG6CF4t2VWH2QyTvK name='spike-child'
+  archive agent agent_011CaTLmpSbB85NbHcZzufx9 name='spike-agent-a'
+```
 
-**Fill in after running.** Decision matrix for the larger project:
+`agents` are archived (no DELETE endpoint exists); `environments` and `sessions` are hard-deleted.
 
-- **PASS:** agent-creates-agent IS viable via host-mediated custom tools. Build the larger project on this pattern. Note that you will need a long-running host process (or a webhook/SSE listener) to handle `agent.custom_tool_use` events out-of-band; "fire and forget" sessions that need to spawn agents won't work without one.
-- **FAIL:** stop and re-evaluate. The two follow-up paths are (a) MCP server proxy — spin up an MCP server that wraps `agents.create()` and put its credentials in a vault, or (b) wait for Anthropic to expose a built-in agent-management tool.
+## Quirks and surprises
 
-## Cost so far
+1. **`agent.custom_tool_use.id` doubles as the resolution key.** The same value goes back as `custom_tool_use_id`. Cleaner than the messages API's separate `tool_use_id`.
+2. **`session.status_idle` is overloaded.** Same event type for "agent finished its turn" and "agent is blocked waiting for me". Discriminator is `stop_reason.type`. Treating *any* idle as turn-end (which my pre-run draft did) would have caused the spike to "complete" before the host ever resolved the tool call.
+3. **`spans` events fire around inference.** `span.model_request_start` / `span.model_request_end` bracket each inference call. The events doc lists these but the overview implies cleaner Claude/user/MCP grouping; the spans interleave throughout. Filter them out for any user-facing UX.
+4. **Output cap = sane.** Agent A's "Be terse" system prompt produced exactly the agent_id literal as the final message. No "Here is the new agent's ID:" preamble. With `claude-opus-4-7`, terse instructions stick.
+5. **No `delete` for agents.** Cleanup uses `archive`. Archived agents still appear in `agents.list(include_archived=True)` and presumably can't be reused for new sessions; budget for the archived-agent count if you spawn lots.
+6. **List `limit` cap is 100, not 1000** as the events doc claims. (Per-resource list endpoints.)
+7. **`limit=1000` on `environments.list` did NOT 400** in the same run — silently ignored. Inconsistency.
+8. **Total resources used:** 1 environment + 2 agents + 1 session. Within the 3-agent cap.
 
-- Spike not yet run: $0.
-- Expected on first successful run: ≤ $0.05 (one ~30s session at $0.08/hr is < $0.001; the Opus turn handling the tool call is the dominant cost — likely a few cents).
+## Cost incurred
+
+Approximate, based on Anthropic public pricing:
+
+- Session-hour: 11.5 s × ($0.08/hr) ≈ **$0.0003**
+- Token costs (one Opus-4.7 turn with tool-call + one tiny response): ~1.5–2k input tokens, ~10 output tokens ≈ **$0.02–0.03**
+- **Total ≈ $0.02–0.04.**
+
+Plus a small amount for the docs research / SDK install / aborted cleanup attempt: rounding up, **call it $0.05 total for the spike run**.
+
+## Reproduce
+
+```
+cp .env.example .env       # paste ANTHROPIC_API_KEY
+pip install anthropic python-dotenv
+python3 spike.py           # ~12 s end-to-end
+python3 cleanup.py         # archives spike-* agents, deletes spike-* sessions/envs
+```
+
+Raw events from the run: `spike_events.jsonl` (gitignored).
+
+## What to build on top
+
+Before scaling this pattern, the open questions worth a follow-up spike:
+
+- How does the host receive `agent.custom_tool_use` in production? Polling is fine for one session; for many concurrent sessions use `client.beta.sessions.events.stream()` (SSE) — the SDK exposes it. Webhook story isn't documented in what I read.
+- What happens if the host crashes between receiving the tool-use event and posting the result? Is there a TTL on `requires_action`? The session is just sitting idle — does `$0.08/hr` accrue while idle? That's the cost-control question before going to production.
+- Multi-tenant safety: an Agent A custom tool that creates agents will, by default, do so in YOUR account using YOUR key. If the larger project is meant for end users, the control plane needs per-tenant key isolation (or a separate Anthropic org per tenant).

@@ -44,7 +44,7 @@ def main() -> None:
     # Sessions first (so they don't pin agents/envs).
     print("[sessions]")
     try:
-        for s in (_g(client.beta.sessions.list(limit=1000), "data") or []):
+        for s in client.beta.sessions.list(limit=100):
             if _starts(s, "title"):
                 sid = _g(s, "id")
                 print(f"  delete session {sid} title={_g(s, 'title')!r}")
@@ -57,7 +57,7 @@ def main() -> None:
 
     print("[agents]")
     try:
-        for a in (_g(client.beta.agents.list(limit=1000), "data") or []):
+        for a in client.beta.agents.list(limit=100):
             if _starts(a, "name"):
                 aid = _g(a, "id")
                 print(f"  archive agent {aid} name={_g(a, 'name')!r}")
@@ -70,7 +70,7 @@ def main() -> None:
 
     print("[environments]")
     try:
-        for env in (_g(client.beta.environments.list(limit=1000), "data") or []):
+        for env in client.beta.environments.list(limit=100):
             if _starts(env, "name"):
                 eid = _g(env, "id")
                 print(f"  delete environment {eid} name={_g(env, 'name')!r}")
