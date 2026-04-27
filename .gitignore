@@ -1,0 +1,14 @@
+# secrets
+.env
+.env.local
+.env.*.local
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# spike artifacts (raw event captures may include resource ids)
+spike_events.jsonl

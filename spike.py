@@ -2,23 +2,33 @@
 """
 spike.py - 2-hour verification: can a Managed Agent create another Managed Agent?
 
-Approach (chosen by the user): host-mediated custom tool.
+Approach (chosen): host-mediated custom tool.
 
-Agent A is configured with a single custom tool, `create_managed_agent`. When
-Claude inside Agent A's session decides to invoke it, the session emits an
-`agent.custom_tool_use` event and idles. THIS script (the host) intercepts that
-event, calls `client.beta.agents.create()` itself, and posts the result back
-into the session as a `user.custom_tool_result`. The agent never sees the
-master API key. This is the same pattern a production "Foundry"-style system
-would use; if it works, the foundational architecture is viable.
+Agent A is configured with one custom tool, `create_managed_agent`. When Claude
+invokes it, the session emits an `agent.custom_tool_use` event and goes
+`session.status_idle` with `stop_reason.type == "requires_action"`. THIS script
+intercepts that, calls `client.beta.agents.create()` itself, and posts the
+result back as a `user.custom_tool_result`. The master API key never enters
+the sandbox.
 
 Run: python3 spike.py
 Cleanup afterward: python3 cleanup.py
 
-Hard caps to keep the spike cheap:
-  - Total agents created: 2 (Agent A + spike-child). Cap is 3.
+Hard caps:
+  - Total agents created: 2 (Agent A + spike-child). User cap is 3.
   - Session timeout: 5 minutes.
-  - All resources are prefixed with "spike-" for easy cleanup.
+  - All resources prefixed with "spike-" for cleanup.
+
+Event flow we expect (event types confirmed from anthropic 0.97.0 SDK types):
+  send: user.message
+   <- session.status_running
+   <- agent.custom_tool_use         (id, name, input)
+   <- session.status_idle           (stop_reason.type == "requires_action",
+                                     stop_reason.event_ids == [tool_use.id])
+  send: user.custom_tool_result     (custom_tool_use_id == that id)
+   <- session.status_running
+   <- agent.message                 (content: [TextBlock])
+   <- session.status_idle           (stop_reason.type == "end_turn")  -> DONE
 """
 from __future__ import annotations
 
@@ -26,7 +36,7 @@ import json
 import os
 import sys
 import time
-from typing import Any
+from pathlib import Path
 
 from dotenv import load_dotenv
 import anthropic
@@ -49,57 +59,51 @@ AGENT_A_SYSTEM = (
 
 SESSION_TIMEOUT_S = 300
 POLL_INTERVAL_S = 2
+EVENT_LOG_PATH = Path(__file__).resolve().parent / "spike_events.jsonl"
 
 
-def _g(obj: Any, name: str, default: Any = None) -> Any:
-    """Read a field from a Pydantic model OR a dict."""
-    if obj is None:
-        return default
-    if isinstance(obj, dict):
-        return obj.get(name, default)
-    return getattr(obj, name, default)
-
-
-def _gp(obj: Any, *path: str, default: Any = None) -> Any:
-    cur = obj
-    for p in path:
-        cur = _g(cur, p)
-        if cur is None:
-            return default
-    return cur
-
-
-def _fail(msg: str) -> None:
+def fail(msg: str) -> None:
     print("\n=== FAIL ===")
     print(msg)
     sys.exit(1)
+
+
+def log_event(ev) -> None:
+    """Append every event we observe to spike_events.jsonl for forensics."""
+    try:
+        payload = ev.model_dump(mode="json") if hasattr(ev, "model_dump") else dict(ev)
+    except Exception as e:  # noqa: BLE001
+        payload = {"_dump_error": str(e), "_repr": repr(ev)}
+    with EVENT_LOG_PATH.open("a") as f:
+        f.write(json.dumps(payload) + "\n")
 
 
 def main() -> None:
     t0 = time.time()
     load_dotenv()
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        _fail("ANTHROPIC_API_KEY missing. Copy .env.example to .env and fill it in.")
+        fail("ANTHROPIC_API_KEY missing. Copy .env.example to .env and fill it in.")
+    if EVENT_LOG_PATH.exists():
+        EVENT_LOG_PATH.unlink()
 
     client = anthropic.Anthropic()
 
-    # ---- 1. environment ----------------------------------------------------
+    # 1. environment
     print("[1/6] Creating environment (unrestricted egress)...")
     env = client.beta.environments.create(
         name=f"{PREFIX}env",
         config={"type": "cloud", "networking": {"type": "unrestricted"}},
     )
-    env_id = _g(env, "id")
-    print(f"      env_id={env_id}")
+    print(f"      env_id={env.id}")
 
-    # ---- 2. agent A --------------------------------------------------------
+    # 2. agent A
     print("[2/6] Creating Agent A (meta-agent)...")
     custom_tool = {
         "type": "custom",
         "name": TOOL_NAME,
         "description": (
             "Create a new Managed Agent in this Anthropic account. "
-            "Returns the new agent's ID as JSON: {\"agent_id\": \"agent_...\"}."
+            "Returns the new agent's ID as JSON."
         ),
         "input_schema": {
             "type": "object",
@@ -119,23 +123,21 @@ def main() -> None:
         system=AGENT_A_SYSTEM,
         tools=[custom_tool],
     )
-    agent_a_id = _g(agent_a, "id")
-    print(f"      agent_a_id={agent_a_id}")
+    print(f"      agent_a_id={agent_a.id}")
 
-    # ---- 3. session --------------------------------------------------------
+    # 3. session
     print("[3/6] Creating session...")
     session = client.beta.sessions.create(
-        agent=agent_a_id,
-        environment_id=env_id,
+        agent=agent_a.id,
+        environment_id=env.id,
         title=f"{PREFIX}session",
     )
-    session_id = _g(session, "id")
-    print(f"      session_id={session_id}")
+    print(f"      session_id={session.id}")
 
-    # ---- 4. send the test message ------------------------------------------
+    # 4. test message
     print("[4/6] Sending test message...")
     client.beta.sessions.events.send(
-        session_id=session_id,
+        session_id=session.id,
         events=[
             {
                 "type": "user.message",
@@ -144,110 +146,132 @@ def main() -> None:
         ],
     )
 
-    # ---- 5. poll, handle the custom-tool callback, capture final text ------
+    # 5. poll, handle the custom-tool callback, capture final assistant text
     print("[5/6] Polling session events...")
     seen: set[str] = set()
-    final_text: str | None = None
+    pending_tool_calls: dict[str, tuple[str, dict]] = {}  # event_id -> (name, input)
+    resolved_tool_calls: set[str] = set()
     child_agent_id: str | None = None
-    handled_tool_call = False
+    final_text_parts: list[str] = []
     deadline = time.time() + SESSION_TIMEOUT_S
     done = False
+    last_stop_reason: str | None = None
 
     while not done and time.time() < deadline:
-        page = client.beta.sessions.events.list(session_id=session_id, limit=1000)
-        events = list(_g(page, "data") or [])
-
-        for ev in events:
-            ev_id = _g(ev, "id") or repr(ev)
-            if ev_id in seen:
+        for ev in client.beta.sessions.events.list(session_id=session.id, order="asc"):
+            if ev.id in seen:
                 continue
-            seen.add(ev_id)
-            ev_type = _g(ev, "type")
-            print(f"      <- {ev_type}")
+            seen.add(ev.id)
+            log_event(ev)
+            print(f"      <- {ev.type}  (id={ev.id})")
 
-            if ev_type == "agent.custom_tool_use" and not handled_tool_call:
-                # Try several shapes the event might take.
-                tu = _g(ev, "tool_use") or _g(ev, "custom_tool_use") or ev
-                tu_id = _g(tu, "id") or _g(ev, "tool_use_id") or _g(ev, "custom_tool_use_id")
-                tu_name = _g(tu, "name") or _g(ev, "name")
-                tu_input = _g(tu, "input") or _g(ev, "input") or {}
-                if tu_name != TOOL_NAME:
-                    print(f"      ! unexpected tool: {tu_name}")
-                    continue
+            if ev.type == "agent.custom_tool_use":
+                # Flat shape: ev.id (== custom_tool_use_id), ev.name, ev.input
+                pending_tool_calls[ev.id] = (ev.name, ev.input)
 
-                req_name = (tu_input or {}).get("name", "child")
-                child_name = req_name if req_name.startswith(PREFIX) else f"{PREFIX}{req_name}"
-                child_system = (tu_input or {}).get("system_prompt", "")
-                print(f"      -> host: creating child agent '{child_name}'")
-                child = client.beta.agents.create(
-                    name=child_name,
-                    model=MODEL,
-                    system=child_system,
-                )
-                child_agent_id = _g(child, "id")
-                print(f"      -> child_agent_id={child_agent_id}")
+            elif ev.type == "agent.message":
+                for block in ev.content:
+                    if getattr(block, "type", None) == "text" and block.text:
+                        final_text_parts.append(block.text)
 
-                client.beta.sessions.events.send(
-                    session_id=session_id,
-                    events=[
-                        {
-                            "type": "user.custom_tool_result",
-                            "custom_tool_use_id": tu_id,
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": json.dumps({"agent_id": child_agent_id}),
-                                }
-                            ],
-                        }
-                    ],
-                )
-                handled_tool_call = True
-
-            elif ev_type == "agent.message":
-                content = _g(ev, "content") or _gp(ev, "message", "content") or []
-                if isinstance(content, list):
-                    for blk in content:
-                        if _g(blk, "type") == "text":
-                            t = _g(blk, "text")
-                            if t:
-                                final_text = t
-
-            elif ev_type == "session.status_idle":
-                if handled_tool_call:
+            elif ev.type == "session.status_idle":
+                last_stop_reason = ev.stop_reason.type
+                print(f"         stop_reason={last_stop_reason}")
+                if last_stop_reason == "end_turn":
                     done = True
                     break
+                if last_stop_reason == "retries_exhausted":
+                    fail(f"Session retries exhausted. event={ev!r}")
+                if last_stop_reason == "requires_action":
+                    # Resolve every pending tool call listed in event_ids.
+                    for tu_id in ev.stop_reason.event_ids:
+                        if tu_id in resolved_tool_calls:
+                            continue
+                        if tu_id not in pending_tool_calls:
+                            fail(
+                                f"Session requires action on {tu_id} but we never "
+                                f"saw the corresponding agent.custom_tool_use event."
+                            )
+                        name, tool_input = pending_tool_calls[tu_id]
+                        if name != TOOL_NAME:
+                            fail(f"Unexpected tool: {name!r} (input={tool_input!r})")
 
-            elif ev_type in ("session.status_terminated", "session.error"):
-                _fail(f"Session ended unexpectedly: {ev_type}\nevent={ev!r}")
+                        req_name = (tool_input or {}).get("name", "child")
+                        child_name = (
+                            req_name
+                            if req_name.startswith(PREFIX)
+                            else f"{PREFIX}{req_name}"
+                        )
+                        child_system = (tool_input or {}).get("system_prompt", "")
+                        print(f"      -> host: creating child agent '{child_name}'")
+                        child = client.beta.agents.create(
+                            name=child_name,
+                            model=MODEL,
+                            system=child_system,
+                        )
+                        child_agent_id = child.id
+                        print(f"      -> child_agent_id={child_agent_id}")
+
+                        client.beta.sessions.events.send(
+                            session_id=session.id,
+                            events=[
+                                {
+                                    "type": "user.custom_tool_result",
+                                    "custom_tool_use_id": tu_id,
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": json.dumps({"agent_id": child.id}),
+                                        }
+                                    ],
+                                }
+                            ],
+                        )
+                        resolved_tool_calls.add(tu_id)
+
+            elif ev.type == "session.status_terminated":
+                fail(f"Session terminated: {ev!r}")
+            elif ev.type == "session.error":
+                fail(f"Session error: {ev!r}")
 
         if not done:
             time.sleep(POLL_INTERVAL_S)
 
     if not done:
-        _fail(f"Timed out after {SESSION_TIMEOUT_S}s waiting for session to idle.")
+        fail(
+            f"Timed out after {SESSION_TIMEOUT_S}s. "
+            f"last_stop_reason={last_stop_reason!r} "
+            f"resolved={len(resolved_tool_calls)}/{len(pending_tool_calls)} "
+            f"final_text={''.join(final_text_parts)!r}"
+        )
 
-    # ---- 6. verify ---------------------------------------------------------
+    # 6. verify
     print("[6/6] Verifying child via agents.list()...")
-    listing = client.beta.agents.list(limit=1000)
-    agents = list(_g(listing, "data") or [])
-    matched = [a for a in agents if _g(a, "name") == CHILD_NAME]
+    matched = [
+        a for a in client.beta.agents.list() if a.name == CHILD_NAME
+    ]
     elapsed = time.time() - t0
+    final_text = "".join(final_text_parts)
 
     print()
-    print(f"  agent_a_id     = {agent_a_id}")
+    print(f"  agent_a_id     = {agent_a.id}")
     print(f"  child_agent_id = {child_agent_id}")
-    print(f"  matched in list: {[_g(a, 'id') for a in matched]}")
+    print(f"  matched in list: {[a.id for a in matched]}")
     print(f"  agent A final text: {final_text!r}")
     print(f"  elapsed: {elapsed:.1f}s")
+    print(f"  raw events: {EVENT_LOG_PATH}")
 
-    if matched and child_agent_id and any(_g(a, "id") == child_agent_id for a in matched):
+    if (
+        matched
+        and child_agent_id
+        and any(a.id == child_agent_id for a in matched)
+    ):
         print("\n=== PASS ===")
-        print("Agent A successfully drove creation of spike-child via the")
-        print("host-mediated custom tool, and spike-child appears in agents.list().")
+        print("Agent A drove creation of spike-child via the host-mediated")
+        print("custom tool, and spike-child appears in agents.list().")
         print("\nRun `python3 cleanup.py` to archive/delete spike-* resources.")
     else:
-        _fail("spike-child not found in agents.list() under expected ID.")
+        fail("spike-child not found in agents.list() under expected ID.")
 
 
 if __name__ == "__main__":
