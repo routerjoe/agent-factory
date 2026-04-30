@@ -12,9 +12,9 @@ Estimated cost: **~$0.15** in token + session-hour charges (under the $5 cap, we
 
 | Question | Answer |
 |---|---|
-| **T1 Idle billing** | **$0/hr while idle.** `stats.active_seconds` is flat at **2.946 s** from t=0 to t=15 min to t=60 min while `duration_seconds` grows linearly. Idle in `requires_action` does not consume billable active time. *(t=240 min sample pending from background poller; see § T1.)* |
+| **T1 Idle billing** | **$0/hr while idle.** `stats.active_seconds` is flat at **2.946 s** from t=0 → t=15 min → t=60 min → **t=78.5 hr** while `duration_seconds` grows 1-for-1 with wall-clock. Idle in `requires_action` does not consume billable active time. (t=78.5 hr datapoint is a serendipitous bonus — see § T1 — far stronger than the planned t=240 min.) |
 | **T2 Idempotency** | **API silently accepts duplicate posts** (200 OK on every attempt — first, duplicate, AND a different-content post for the same `tool_use_id`). The session uses **only the first** post; subsequent ones are silently dropped. **First-write-wins.** |
-| **T3 Session timeout** | **No timeout observed in 60 min.** Session stayed `status=idle` with `active_seconds` flat the entire window, and 60 status polls returned no change. Floor is **≥ 60 min**; true upper bound undocumented and not measurable in this spike. |
+| **T3 Session timeout** | **No timeout observed up to 78.5 hours.** Session stayed `status=idle` with `active_seconds` flat the entire window, and the 60-min sampling loop returned `idle` 60/60 times. Bonus 78.5-hour sample (from the resurrected T1 session) also returned `idle`. Floor is **≥ 78.5 hr**; true upper bound still undocumented. |
 | **T4 Mid-flight cancellation** | **Yes, children orphan.** `DELETE /v1/sessions/{id}` hard-deletes the session (subsequent retrieve returns 404). The child agent created by the host before the delete remained in `agents.list()`. **No cascade cleanup.** |
 
 ## Architecture verdict
@@ -32,14 +32,14 @@ Session: `sesn_011CaTc2zk8CsmBb3Y7VU9oQ` (parent agent: `spike1b-billing-test`).
 | t=0 | 0 s | **2.946** | 11.11 s | idle |
 | t=15 min | 900 s | **2.946** | 907.13 s | idle |
 | t=60 min | 3600 s | **2.946** | 3608.84 s | idle |
-| t=240 min | 14400 s | *pending — written by `spike_1b_t240_poller.py`* | | |
-| post-drain | — | *pending — written after t=240 sample* | | |
+| **t=78.5 hr** | 282 670 s | **2.946** | 282 670.31 s | idle |
+| post-drain (after fake tool result) | +30 s | 6.178 (+3.23 for one inference turn) | 282 732.76 s | idle / `end_turn` |
 
-**Reading.** `active_seconds` is the metric Anthropic almost certainly bills against the $0.08/hr session-hour rate. It is **frozen at 2.946 s — the cost of the single inference turn that produced the `agent.custom_tool_use` event** — for the entire idle window. `duration_seconds` grows roughly 1-for-1 with wall-clock time but does not appear to be billed. After T3 was drained the same pattern held: `active` jumped from 2.746 s to 7.23 s when the agent processed the tool result, then stopped again. Active = inference, not wall-clock.
+**Reading.** `active_seconds` is the metric Anthropic almost certainly bills against the $0.08/hr session-hour rate. It is **frozen at 2.946 s — the cost of the single inference turn that produced the `agent.custom_tool_use` event** — for the *entire* idle window, including a 78.5-hour stretch. `duration_seconds` grows 1-for-1 with wall-clock and does not appear to be billed. After draining (posting the tool result), `active_seconds` stepped up to 6.178 s — exactly one inference turn's worth — confirming **active = inference, not wall-clock**. The same pattern held in T3 (active jumped from 2.746 to 7.23 after drain).
 
-**Implication.** Stuck `requires_action` sessions are essentially free. A control plane can retry, defer, or just leave a session pending for hours without cost pressure. The only real bound is whatever upper-limit Anthropic enforces (T3 says ≥ 60 min; full bound unknown).
+**Bonus on duration.** The originally planned t=240 min sample was missed because the sandbox running the detached poller was suspended for ~3 days between the spike (April 27) and the user's followup (April 30). When the poller was re-launched, the session was still alive, still `idle`, still `active=2.946` — making this a much stronger result than originally planned. **A session can sit in `requires_action` for at least 3 days, fully responsive, with zero billable growth.** The session was then drained successfully, proving end-to-end durability across the suspension.
 
-The t=240 sample is being captured by a detached process (`spike_1b_t240_poller.py`) that wakes at `2026-04-27T07:58:05+00:00`, samples, drains the session, and appends to `spike1b_results.json`. Run `python3 cleanup_1b.py` only AFTER `spike1b_t240_poller.log` ends with `[poller] DONE.`
+**Implication.** Stuck `requires_action` sessions are essentially free *and durable for days*. A control plane can retry, defer, batch overnight, or fail over to a new host hours later without losing pending sessions or paying for the wait. The only real bound is whatever upper-limit Anthropic enforces — empirically that is now **≥ 78.5 hours** (vs the originally planned ≥ 4 hours), and the true ceiling remains undocumented.
 
 ---
 
@@ -79,9 +79,9 @@ Session: `sesn_011CaTc3QXMn9ksR4YsZrGzM`. 60 samples at 60-second intervals over
 | t=60 min final | 2.746 | 3608.52 | idle |
 | post-drain | **7.23** | 3616.32 | idle |
 
-**Reading.** Across all 60 samples: zero status transitions, zero `active_seconds` growth. Session was reachable and queryable throughout. After we posted the tool result, the agent processed it within ~8 s and produced a final reply (drain text: `` `agent_drain_noop` ``).
+**Reading.** Across all 60 samples: zero status transitions, zero `active_seconds` growth. Session was reachable and queryable throughout. After we posted the tool result, the agent processed it within ~8 s and produced a final reply (drain text: `` `agent_drain_noop` ``). The T1 session — accidentally left running through a 3-day sandbox suspension — independently extends this floor to **≥ 78.5 hours** with no observed timeout.
 
-**Implication.** No documented timeout, no observed timeout up to 60 min. The empirical floor is ≥60 min; the true ceiling is unknown. For the control plane, this means:
+**Implication.** No documented timeout, no observed timeout up to 78.5 hours. The empirical floor is ≥ 78.5 hr; the true ceiling is unknown. For the control plane, this means:
 - Don't rely on Anthropic to garbage-collect stuck sessions for you.
 - A reaper of your own (cron over `client.beta.sessions.list()` filtering by `created_at_lte` and status) is the safe pattern.
 - You can leave sessions parked for at least an hour without losing them.
